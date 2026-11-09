@@ -1,88 +1,145 @@
 #!/usr/bin/env python3
 """
 reroute_engine.py
-
-Core Responsibilities:
-1. Extracts the Fat-Tree topology directly from `fattree_topo.py` into a NetworkX DiGraph.
-2. Tracks per-link capacity, used bandwidth, and residual bandwidth.
-3. Implements the Hedera-style Global First-Fit (GFF) dynamic rerouting algorithm.
-4. Provides clean APIs for the Ryu controller to allocate and reroute elephant flows.
 """
 
 import networkx as nx
-from fattree_topo import FatTreeTopo
 import config
 
 try:
     DEFAULT_BW = config.LINK_BANDWIDTH
+    K = config.K_FAT_TREE
 except AttributeError:
     DEFAULT_BW = 10.0
+    K = 4
 
 
 class RerouteEngine:
-    def __init__(self, topo=None):
-        """
-        Initializes the dynamic graph directly from a Mininet Topo instance.
-        """
-        self.topo = topo if topo is not None else FatTreeTopo(k=config.K_FAT_TREE)
+    def __init__(self, k=K, link_bw=DEFAULT_BW):
+        self.k = k
+        self.link_bw = link_bw
         self.graph = nx.DiGraph()
-        
+
+        self.switches = []
+        self.hosts = []
         self.dpid_to_name = {}
         self.name_to_dpid = {}
         self.host_to_edge = {}
         self.ip_to_edge = {}
-        self.port_map = {}
-        
+        self.ip_to_mac = {}
+        self.ip_to_host = {}
+        self.host_to_ip = {}
+        self.port_map = {}       # (u, v) -> egress port on u to reach v
+
         self.active_reservations = {}
         self._path_cache = {}
-        
-        self._build_graph_from_topo()
+
+        self._build_fattree_fabric()
         self._precompute_all_shortest_paths()
 
-    def _build_graph_from_topo(self):
-        """
-        Converts the Mininet FatTreeTopo instance into a NetworkX directed graph.
-        Links are full-duplex, so each link is modeled as two directed edges (u->v and v->u).
-        """
-        for sw in self.topo.switches():
-            dpid_str = self.topo.nodeInfo(sw).get('dpid')
-            if dpid_str:
-                dpid_int = int(dpid_str, 16)
-                self.dpid_to_name[dpid_int] = sw
-                self.name_to_dpid[sw] = dpid_int
-            self.graph.add_node(sw, type='switch')
+    def _dpid_format(self, layer_id, pod_id, switch_id):
+        """16-digit hex DPID matching fattree_topo.py."""
+        return f"{0:010x}{layer_id:02x}{pod_id:02x}{switch_id:02x}"
 
-        for host in self.topo.hosts():
-            self.graph.add_node(host, type='host')
-            ip = self.topo.nodeInfo(host).get('ip', '').split('/')[0]
-            if ip:
-                self.graph.nodes[host]['ip'] = ip
-            
-        for src, dst in self.topo.links():
-            p1, p2 = self.topo.port(src, dst)
-            self.port_map[(src, dst)] = p1
-            self.port_map[(dst, src)] = p2
-            
-            if self.topo.isSwitch(src) and not self.topo.isSwitch(dst):
-                self.host_to_edge[dst] = src
-                ip = self.graph.nodes[dst].get('ip')
-                if ip:
-                    self.ip_to_edge[ip] = src
-            elif self.topo.isSwitch(dst) and not self.topo.isSwitch(src):
-                self.host_to_edge[src] = dst
-                ip = self.graph.nodes[src].get('ip')
-                if ip:
-                    self.ip_to_edge[ip] = dst
+    def _build_fattree_fabric(self):
+        """Constructs the Fat-Tree graph, DPIDs, and deterministic port mappings."""
+        half_k = self.k // 2
+        num_pods = self.k
+        agg_switches = {}
+        edge_switches = {}
 
-            self.graph.add_edge(src, dst, capacity=DEFAULT_BW, used_bw=0.0, residual_bw=DEFAULT_BW)
-            self.graph.add_edge(dst, src, capacity=DEFAULT_BW, used_bw=0.0, residual_bw=DEFAULT_BW)
+        # -------------------------------------------------------------
+        # 1. Core Switches
+        # -------------------------------------------------------------
+        for i in range(half_k):
+            for j in range(half_k):
+                core_id = i * half_k + j
+                sw_name = f'c_{i}_{j}'
+                dpid_hex = self._dpid_format(layer_id=1, pod_id=0, switch_id=core_id)
+                dpid_int = int(dpid_hex, 16)
+
+                self.switches.append(sw_name)
+                self.dpid_to_name[dpid_int] = sw_name
+                self.name_to_dpid[sw_name] = dpid_int
+                self.graph.add_node(sw_name, type='switch', layer='core')
+
+        # -------------------------------------------------------------
+        # 2. Pods (Aggregation, Edge, Hosts)
+        # -------------------------------------------------------------
+        for p in range(num_pods):
+            # Aggregation switches
+            for a in range(half_k):
+                sw_name = f'a_{p}_{a}'
+                dpid_hex = self._dpid_format(layer_id=2, pod_id=p, switch_id=a)
+                dpid_int = int(dpid_hex, 16)
+                agg_switches[(p, a)] = sw_name
+                self.switches.append(sw_name)
+                self.dpid_to_name[dpid_int] = sw_name
+                self.name_to_dpid[sw_name] = dpid_int
+                self.graph.add_node(sw_name, type='switch', layer='agg')
+
+            # Edge switches and Hosts
+            for e in range(half_k):
+                sw_name = f'e_{p}_{e}'
+                dpid_hex = self._dpid_format(layer_id=3, pod_id=p, switch_id=e + 1)
+                dpid_int = int(dpid_hex, 16)
+                edge_switches[(p, e)] = sw_name
+                self.switches.append(sw_name)
+                self.dpid_to_name[dpid_int] = sw_name
+                self.name_to_dpid[sw_name] = dpid_int
+                self.graph.add_node(sw_name, type='switch', layer='edge')
+
+                # Connect Edge <-> Agg within Pod
+                for a in range(half_k):
+                    agg_name = agg_switches[(p, a)]
+                    # Edge port to agg: a + 1
+                    # Agg port to edge: e + 1
+                    p_edge = a + 1
+                    p_agg = e + 1
+                    self._add_bidirectional_link(sw_name, agg_name, p_edge, p_agg)
+
+                # Connect Hosts <-> Edge
+                for h in range(half_k):
+                    h_name = f'h_{p}_{e}_{h}'
+                    ip_addr = f'10.{p}.{e}.{h + 2}'
+                    mac_addr = f'00:00:00:{p:02x}:{e:02x}:{(h + 2):02x}'
+
+                    self.hosts.append(h_name)
+                    self.host_to_edge[h_name] = sw_name
+                    self.ip_to_edge[ip_addr] = sw_name
+                    self.ip_to_mac[ip_addr] = mac_addr
+                    self.ip_to_host[ip_addr] = h_name
+                    self.host_to_ip[h_name] = ip_addr
+
+                    self.graph.add_node(h_name, type='host', ip=ip_addr, mac=mac_addr)
+                    # Edge downlink ports: 3, 4 (half_k + h + 1)
+                    p_edge = half_k + h + 1
+                    p_host = 1
+                    self._add_bidirectional_link(sw_name, h_name, p_edge, p_host)
+
+        # -------------------------------------------------------------
+        # 3. Core <-> Aggregation Links
+        # -------------------------------------------------------------
+        for i in range(half_k):
+            for j in range(half_k):
+                core_name = f'c_{i}_{j}'
+                for p in range(num_pods):
+                    agg_name = agg_switches[(p, i)]
+                    # Core port to pod p: p + 1
+                    # Agg uplink port: half_k + j + 1
+                    p_core = p + 1
+                    p_agg = half_k + j + 1
+                    self._add_bidirectional_link(core_name, agg_name, p_core, p_agg)
+
+    def _add_bidirectional_link(self, u, v, port_u, port_v):
+        """Adds symmetric directed edges and records physical port numbers."""
+        self.port_map[(u, v)] = port_u
+        self.port_map[(v, u)] = port_v
+        self.graph.add_edge(u, v, capacity=self.link_bw, used_bw=0.0, residual_bw=self.link_bw)
+        self.graph.add_edge(v, u, capacity=self.link_bw, used_bw=0.0, residual_bw=self.link_bw)
 
     def _precompute_all_shortest_paths(self):
-        """
-        Precomputes all equal-cost shortest paths between every pair of edge switches.
-        In a k=4 Fat-Tree, there are exactly 4 parallel paths through the core switches.
-        """
-        edge_switches = [n for n in self.graph.nodes if n.startswith('e_')]
+        edge_switches = [n for n in self.switches if n.startswith('e_')]
         for src in edge_switches:
             for dst in edge_switches:
                 if src == dst:
@@ -91,24 +148,21 @@ class RerouteEngine:
                     paths = list(nx.all_shortest_paths(self.graph, source=src, target=dst))
                     self._path_cache[(src, dst)] = paths
 
-    def get_candidate_paths(self, src_node, dst_node):
-        """
-        Returns all candidate equal-cost paths between any two nodes.
-        Automatically resolves host names to their attached edge switches.
-        """
-        src_edge = self.ip_to_edge.get(src_node, self.host_to_edge.get(src_node, src_node))
-        dst_edge = self.ip_to_edge.get(dst_node, self.host_to_edge.get(dst_node, dst_node))
-        
+    def resolve_to_edge(self, node_or_ip):
+        if node_or_ip in self.ip_to_edge:
+            return self.ip_to_edge[node_or_ip]
+        if node_or_ip in self.host_to_edge:
+            return self.host_to_edge[node_or_ip]
+        return node_or_ip
+
+    def get_candidate_paths(self, src_node_or_ip, dst_node_or_ip):
+        src_edge = self.resolve_to_edge(src_node_or_ip)
+        dst_edge = self.resolve_to_edge(dst_node_or_ip)
         return self._path_cache.get((src_edge, dst_edge), [])
 
     def get_path_bottleneck_residual(self, path):
-        """
-        Computes the minimum residual bandwidth along a given path:
-        B(p) = min(residual_bw(u, v)) for all (u, v) in path
-        """
         if len(path) <= 1:
             return float('inf')
-        
         bottleneck = float('inf')
         for i in range(len(path) - 1):
             u, v = path[i], path[i + 1]
@@ -118,17 +172,6 @@ class RerouteEngine:
         return bottleneck
 
     def compute_optimal_path(self, flow_id, demand_mbps, src, dst):
-        """
-        Hedera-style Global First-Fit (GFF) / Best-Fit Rerouting:
-        1. Finds all candidate equal-cost paths between src and dst.
-        2. Filters paths where bottleneck residual capacity >= demand_mbps.
-        3. If multiple paths qualify, picks the one with the maximum residual capacity.
-        4. If no path satisfies the full demand, picks the path with the largest available bottleneck capacity.
-        5. Updates reservations and link residual capacities.
-        
-        Returns:
-            optimal_path (list of node names), bottleneck_capacity (float)
-        """
         candidate_paths = self.get_candidate_paths(src, dst)
         if not candidate_paths:
             return None, 0.0
@@ -154,9 +197,6 @@ class RerouteEngine:
         return best_path, best_cap
 
     def _book_bandwidth(self, flow_id, path, demand_mbps):
-        """
-        Deducts demand_mbps from all directed links on the chosen path.
-        """
         for i in range(len(path) - 1):
             u, v = path[i], path[i + 1]
             self.graph[u][v]['used_bw'] += demand_mbps
@@ -168,12 +208,8 @@ class RerouteEngine:
         }
 
     def release_flow(self, flow_id):
-        """
-        Frees up bandwidth previously booked by an elephant flow when it completes.
-        """
         if flow_id not in self.active_reservations:
             return
-
         info = self.active_reservations.pop(flow_id)
         path = info['path']
         demand = info['demand']
@@ -183,72 +219,21 @@ class RerouteEngine:
             self.graph[u][v]['used_bw'] = max(0.0, self.graph[u][v]['used_bw'] - demand)
             self.graph[u][v]['residual_bw'] = min(self.graph[u][v]['capacity'], self.graph[u][v]['capacity'] - self.graph[u][v]['used_bw'])
 
-    def get_core_utilization_summary(self):
-        """
-        Returns a dictionary showing utilization across all 4 core switches.
-        Crucial for plotting load-balancing variance in your project benchmarks!
-        """
-        core_switches = [n for n in self.graph.nodes if n.startswith('c_')]
-        summary = {}
-        for c in sorted(core_switches):
-            # Sum inbound/outbound bandwidth through the core switch
-            total_load = sum(self.graph[u][c]['used_bw'] for u in self.graph.predecessors(c))
-            summary[c] = total_load
-        return summary
+    def get_port(self, u, v):
+        return self.port_map.get((u, v))
+
+    def get_path_ports(self, path):
+        out_instructions = []
+        for i in range(len(path) - 1):
+            curr_node, next_node = path[i], path[i + 1]
+            port = self.get_port(curr_node, next_node)
+            out_instructions.append((curr_node, port))
+        return out_instructions
 
 
 if __name__ == '__main__':
-    print("=" * 65)
-    print("TESTING REROUTE ENGINE (HEDERA GLOBAL FIRST-FIT)")
-    print("=" * 65)
-
-    # 1. Initialize engine directly with FatTree topology
+    print("Testing pure Python RerouteEngine...")
     engine = RerouteEngine()
-    print(f"Graph initialized with {engine.graph.number_of_nodes()} nodes and {engine.graph.number_of_edges()} directed edges.")
-    print(f"Core switches mapped: {[n for n in engine.graph.nodes if n.startswith('c_')]}\n")
-
-    # 2. Inspect candidate paths between two hosts in different pods
-    src_host = 'h_0_0_0'  # Pod 0
-    dst_host = 'h_2_0_0'  # Pod 2
-    paths = engine.get_candidate_paths(src_host, dst_host)
-    print(f"Candidate parallel paths between {src_host} and {dst_host} ({len(paths)} core paths found):")
-    for idx, p in enumerate(paths, 1):
-        print(f"  Path {idx}: {' -> '.join(p)}")
-    print()
-
-    # 3. Simulate Flow 1 (Elephant: 6.0 Mbps)
-    flow1_id = "flow_h0_to_h2"
-    print(f"--- Allocating Flow 1 ({flow1_id}: 6.0 Mbps) ---")
-    p1, cap1 = engine.compute_optimal_path(flow1_id, 6.0, src_host, dst_host)
-    print(f"Flow 1 Assigned Path: {' -> '.join(p1)} (Remaining BottleNeck: {cap1:.1f} Mbps)")
-    print("Core link utilization:", engine.get_core_utilization_summary())
-    print()
-
-    # 4. Simulate Flow 2 (Elephant Collision: 6.0 Mbps from h_0_0_1 to h_2_0_1)
-    # Under naive ECMP, this might collide on the same core switch and drop packets.
-    # The RerouteEngine should automatically divert it to an alternate core switch!
-    flow2_id = "flow_h01_to_h21"
-    src_host2 = 'h_0_0_1'
-    dst_host2 = 'h_2_0_1'
-    print(f"--- Allocating Flow 2 ({flow2_id}: 6.0 Mbps) ---")
-    p2, cap2 = engine.compute_optimal_path(flow2_id, 6.0, src_host2, dst_host2)
-    print(f"Flow 2 Assigned Path: {' -> '.join(p2)} (Remaining BottleNeck: {cap2:.1f} Mbps)")
-    print("Core link utilization:", engine.get_core_utilization_summary())
-    print()
-
-    # 5. Verify that paths use DIFFERENT core switches!
-    core_f1 = [n for n in p1 if n.startswith('c_')][0]
-    core_f2 = [n for n in p2 if n.startswith('c_')][0]
-    print("=" * 65)
-    print(f"Flow 1 Core Switch: {core_f1}")
-    print(f"Flow 2 Core Switch: {core_f2}")
-    if core_f1 != core_f2:
-        print("SUCCESS! Reroute engine avoided collision and balanced traffic across the core switches.")
-    else:
-        print("NOTICE: Both placed on same core (check capacities).")
-    print("=" * 65)
-
-    # 6. Test flow release
-    print("\n--- Releasing Flow 1 ---")
-    engine.release_flow(flow1_id)
-    print("Core link utilization after releasing Flow 1:", engine.get_core_utilization_summary())
+    print(f"Nodes: {engine.graph.number_of_nodes()}, Edges: {engine.graph.number_of_edges()}")
+    p, cap = engine.compute_optimal_path("test", 5.0, "10.0.0.2", "10.2.0.2")
+    print(f"Path: {' -> '.join(p)}, Bottleneck: {cap} Mbps")

@@ -1,15 +1,18 @@
-# main_controller.py
-# Ryu controller for our project. It does 3 things:
-#   1. answers ARP requests itself (so we never flood in the fat-tree, it has loops)
-#   2. installs normal paths for every new flow (priority 10)
-#        static   -> always the first path
-#        ecmp     -> path chosen by hashing the 5-tuple
-#        proposed -> same as ecmp, but elephants get rerouted
-#   3. (proposed only) when flow_monitor finds an elephant, ask reroute_engine
-#      for the best path and install it with priority 100
-#
-# Run:  SDN_SCHEME=proposed ryu-manager main_controller.py --ofp-tcp-listen-port 6653
-#       (SDN_SCHEME can be static, ecmp or proposed)
+#!/usr/bin/env python3
+"""
+main_controller.py
+Ryu controller for our project. It does 3 things:
+  1. answers ARP requests itself (so we never flood in the fat-tree, it has loops)
+  2. installs normal paths for every new flow (priority 10)
+       static   -> always the first path
+       ecmp     -> path chosen by hashing the 5-tuple
+       proposed -> same as ecmp, but elephants get rerouted
+  3. (proposed only) when flow_monitor finds an elephant, ask reroute_engine
+     for the best path and install it with priority 100
+
+Run:  SDN_SCHEME=proposed ryu-manager main_controller.py --ofp-tcp-listen-port 6653
+      (SDN_SCHEME can be static, ecmp or proposed)
+"""
 
 import zlib
 
@@ -37,14 +40,8 @@ class MainController(FlowMonitor):
 
         self.engine = RerouteEngine()
 
-        # ip -> host name and ip -> mac, taken from the topology
-        self.ip_to_host = {}
-        self.ip_to_mac = {}
-        for host in self.engine.topo.hosts():
-            info = self.engine.topo.nodeInfo(host)
-            ip = info['ip'].split('/')[0]
-            self.ip_to_host[ip] = host
-            self.ip_to_mac[ip] = info['mac']
+        self.ip_to_host = self.engine.ip_to_host
+        self.ip_to_mac = self.engine.ip_to_mac
 
         self.logger.info('controller started, scheme = %s', self.scheme)
 
