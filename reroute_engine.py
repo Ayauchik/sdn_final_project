@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 reroute_engine.py
-Author: Member 4 (Path Routing & Graph Engine)
 
 Core Responsibilities:
 1. Extracts the Fat-Tree topology directly from `fattree_topo.py` into a NetworkX DiGraph.
@@ -31,9 +30,10 @@ class RerouteEngine:
         self.dpid_to_name = {}
         self.name_to_dpid = {}
         self.host_to_edge = {}
+        self.ip_to_edge = {}
+        self.port_map = {}
         
         self.active_reservations = {}
-        
         self._path_cache = {}
         
         self._build_graph_from_topo()
@@ -54,12 +54,25 @@ class RerouteEngine:
 
         for host in self.topo.hosts():
             self.graph.add_node(host, type='host')
-
+            ip = self.topo.nodeInfo(host).get('ip', '').split('/')[0]
+            if ip:
+                self.graph.nodes[host]['ip'] = ip
+            
         for src, dst in self.topo.links():
+            p1, p2 = self.topo.port(src, dst)
+            self.port_map[(src, dst)] = p1
+            self.port_map[(dst, src)] = p2
+            
             if self.topo.isSwitch(src) and not self.topo.isSwitch(dst):
                 self.host_to_edge[dst] = src
+                ip = self.graph.nodes[dst].get('ip')
+                if ip:
+                    self.ip_to_edge[ip] = src
             elif self.topo.isSwitch(dst) and not self.topo.isSwitch(src):
                 self.host_to_edge[src] = dst
+                ip = self.graph.nodes[src].get('ip')
+                if ip:
+                    self.ip_to_edge[ip] = dst
 
             self.graph.add_edge(src, dst, capacity=DEFAULT_BW, used_bw=0.0, residual_bw=DEFAULT_BW)
             self.graph.add_edge(dst, src, capacity=DEFAULT_BW, used_bw=0.0, residual_bw=DEFAULT_BW)
@@ -83,8 +96,8 @@ class RerouteEngine:
         Returns all candidate equal-cost paths between any two nodes.
         Automatically resolves host names to their attached edge switches.
         """
-        src_edge = self.host_to_edge.get(src_node, src_node)
-        dst_edge = self.host_to_edge.get(dst_node, dst_node)
+        src_edge = self.ip_to_edge.get(src_node, self.host_to_edge.get(src_node, src_node))
+        dst_edge = self.ip_to_edge.get(dst_node, self.host_to_edge.get(dst_node, dst_node))
         
         return self._path_cache.get((src_edge, dst_edge), [])
 

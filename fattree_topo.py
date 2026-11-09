@@ -98,7 +98,7 @@ class FatTreeTopo(Topo):
                 for host_id in range(self.num_hosts_per_edge):
                     host_name = f'h_{pod_id}_{edge_id}_{host_id}'
                     
-                    ip_addr = f'10.{pod_id}.{edge_id}.{host_id + 2}/24'
+                    ip_addr = f'10.{pod_id}.{edge_id}.{host_id + 2}/8'
                     mac_addr = f'00:00:00:{pod_id:02x}:{edge_id:02x}:{(host_id + 2):02x}'
                     
                     self.addHost(host_name, ip=ip_addr, mac=mac_addr)
