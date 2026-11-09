@@ -1,14 +1,1 @@
 epoch,scheme,event
-1794241659.535,proposed,ELEPHANT 10.0.0.2->10.2.0.2
-1794241659.599,proposed,reroute h_0_0_0->h_2_0_0 via c_0_0
-1794241659.535,proposed,ELEPHANT 10.0.0.3->10.2.0.3
-1794241659.607,proposed,reroute h_0_0_1->h_2_0_1 via c_1_0
-1794241690.971,proposed,MICE 10.0.0.2->10.2.0.2
-1794241690.971,proposed,MICE 10.0.0.3->10.2.0.3
-1794241763.738,proposed,ELEPHANT 10.0.0.2->10.2.0.2
-1794241763.777,proposed,reroute h_0_0_0->h_2_0_0 via c_0_0
-1794241765.935,proposed,ELEPHANT 10.0.0.3->10.2.0.3
-1794241765.98,proposed,reroute h_0_0_1->h_2_0_1 via c_1_0
-1794241797.182,proposed,ELEPHANT 10.1.0.2->10.3.1.2
-1794241797.273,proposed,reroute h_1_0_0->h_3_1_0 via c_0_0
-1794241799.27,proposed,MICE 10.1.0.2->10.3.1.2

@@ -95,27 +95,40 @@ def print_summary():
     d = config.RESULTS_DIR
     thr = defaultdict(lambda: defaultdict(float))  # scheme -> run -> sum of Mbps
     n = defaultdict(lambda: defaultdict(int))  # scheme -> run -> samples
-    with open(os.path.join(d, "elephant_results.csv")) as f:
-        for r in csv.DictReader(f):
-            thr[r["scheme"]][r["run_id"]] += float(r["throughput_mbps"])
-            n[r["scheme"]][r["run_id"]] += 1
+    
+    elephant_csv = os.path.join(d, "elephant_results.csv")
+    if os.path.exists(elephant_csv):
+        with open(elephant_csv) as f:
+            for r in csv.DictReader(f):
+                thr[r["scheme"]][r["run_id"]] += float(r["throughput_mbps"])
+                n[r["scheme"]][r["run_id"]] += 1
+    else:
+        print("\n[!] Warning: elephant_results.csv not found (no elephant flows recorded).")
+
     fct = defaultdict(list)
     fails = defaultdict(int)
-    if os.path.exists(os.path.join(d, "mice_results.csv")):
-        with open(os.path.join(d, "mice_results.csv")) as f:
+    mice_csv = os.path.join(d, "mice_results.csv")
+    if os.path.exists(mice_csv):
+        with open(mice_csv) as f:
             for r in csv.DictReader(f):
                 if r["status"] == "ok":
                     fct[r["scheme"]].append(float(r["fct_ms"]))
                 else:
                     fails[r["scheme"]] += 1
+
     print(
         "\n%-10s %6s %22s %10s %10s %8s"
         % ("scheme", "runs", "avg elephant Mbps/flow", "mice p50", "mice p99", "failed")
     )
     for s in SCHEMES:
         if s not in thr:
+            # If no elephant data, still print mice statistics
+            v = sorted(fct[s]) or [float("nan")]
+            p50 = v[len(v) // 2] if fct[s] else float("nan")
+            p99 = v[min(len(v) - 1, int(len(v) * 0.99))] if fct[s] else float("nan")
+            print("%-10s %6d %22s %8.0fms %8.0fms %8d" % (s, 0, "N/A", p50, p99, fails[s]))
             continue
-        # average throughput of one elephant sample, per run, then averaged over runs
+
         per_run = [thr[s][r] / n[s][r] for r in thr[s]]
         v = sorted(fct[s]) or [float("nan")]
         print(
@@ -129,7 +142,6 @@ def print_summary():
                 fails[s],
             )
         )
-
 
 def main():
     parser = argparse.ArgumentParser()
